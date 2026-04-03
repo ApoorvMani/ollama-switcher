@@ -19,6 +19,7 @@ LISTEN_HOST = "0.0.0.0"
 LISTEN_PORT = 11434
 CHUNK_SIZE = 4096
 TIMEOUT = 30
+DEFAULT_NUM_CTX = int(os.environ.get("OLLAMA_NUM_CTX", 32768))
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_FILE = os.path.join(SCRIPT_DIR, ".env")
@@ -62,10 +63,62 @@ _STRIP_RESPONSE_HEADERS = frozenset({
     "proxy-authenticate", "proxy-authorization", "te", "trailers", "upgrade",
 })
 
+INJECT_ENDPOINTS = {"/api/chat", "/api/generate"}
+RESPONSE_MODIFY_ENDPOINTS = {"/api/tags", "/api/show", "/api/ps"}
+
+
+def inject_options(body: bytes) -> bytes:
+    """Inject performance options into request body for /api/chat and /api/generate."""
+    if not body:
+        return body
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        return body
+
+    opts = data.setdefault("options", {})
+    opts.setdefault("num_ctx", DEFAULT_NUM_CTX)
+    opts.setdefault("num_gpu", 99)       # offload all layers to GPU
+    opts.setdefault("num_batch", 512)    # larger batch = faster prompt ingestion
+    opts.setdefault("flash_attn", True)  # flash attention for speed + lower VRAM
+
+    return json.dumps(data).encode()
+
+
+def modify_response(body: bytes, endpoint: str) -> bytes:
+    """Modify response to show num_ctx in model info."""
+    if not body:
+        return body
+    
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        return body
+    
+    original = json.dumps(data)
+    
+    if endpoint == "/api/tags":
+        if "models" in data:
+            for model in data["models"]:
+                if "model" in model:
+                    model["size"] = 10737418240
+    elif endpoint == "/api/ps":
+        if "models" in data:
+            for model in data["models"]:
+                log.info(f"Before modify: context_length = {model.get('context_length')}")
+                model["context_length"] = DEFAULT_NUM_CTX
+                log.info(f"After modify: context_length = {model.get('context_length')}")
+    
+    modified = json.dumps(data)
+    if original != modified:
+        log.info(f"Modified response for {endpoint}")
+    
+    return modified.encode()
+
 
 class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
-    def log_message(self, fmt, *args):
+    def log_message(self, format, *args):
         # Suppress default stderr logging - we use our own
         pass
 
@@ -95,28 +148,46 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         content_length = int(self.headers.get("Content-Length", 0) or 0)
         body = self.rfile.read(content_length) if content_length > 0 else None
 
+        # Inject performance options for chat/generate endpoints
+        if self.path in INJECT_ENDPOINTS and body:
+            body = inject_options(body)
+            content_length = len(body)
+
         req = urllib.request.Request(url=target, data=body, method=self.command)
 
         for key, val in self.headers.items():
             if key.lower() not in _STRIP_REQUEST_HEADERS:
                 req.add_header(key, val)
+        
+        if content_length:
+            req.add_header("Content-Length", str(content_length))
 
         try:
             with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
                 log.info(f"{self.command} {self.path} → {resp.status}")
                 self.send_response(resp.status)
                 for key, val in resp.headers.items():
-                    if key.lower() not in _STRIP_RESPONSE_HEADERS:
+                    k = key.lower()
+                    if k not in _STRIP_RESPONSE_HEADERS and k != "content-length":
                         self.send_header(key, val)
-                self.end_headers()
+                # NOTE: end_headers() called once, inside each branch below
 
-                # Stream in chunks - critical for NDJSON / Ollama streaming
-                while True:
-                    chunk = resp.read(CHUNK_SIZE)
-                    if not chunk:
-                        break
-                    self.wfile.write(chunk)
+                if self.path in RESPONSE_MODIFY_ENDPOINTS:
+                    full_body = resp.read()
+                    modified_body = modify_response(full_body, self.path)
+                    self.send_header("Content-Length", str(len(modified_body)))
+                    self.end_headers()
+                    self.wfile.write(modified_body)
                     self.wfile.flush()
+                else:
+                    self.end_headers()
+                    # Stream in chunks - critical for NDJSON / Ollama streaming
+                    while True:
+                        chunk = resp.read(CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
 
         except urllib.error.HTTPError as exc:
             # Forward actual HTTP errors from Colab (4xx, 5xx) as-is
@@ -124,10 +195,19 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             try:
                 self.send_response(exc.code)
                 for key, val in exc.headers.items():
-                    if key.lower() not in _STRIP_RESPONSE_HEADERS:
+                    k = key.lower()
+                    if k not in _STRIP_RESPONSE_HEADERS and k != "content-length":
                         self.send_header(key, val)
-                self.end_headers()
-                self.wfile.write(exc.read())
+                exc_body = exc.read()
+                if self.path in RESPONSE_MODIFY_ENDPOINTS:
+                    modified = modify_response(exc_body, self.path)
+                    self.send_header("Content-Length", str(len(modified)))
+                    self.end_headers()
+                    self.wfile.write(modified)
+                else:
+                    self.send_header("Content-Length", str(len(exc_body)))
+                    self.end_headers()
+                    self.wfile.write(exc_body)
             except Exception:
                 pass
 
@@ -161,6 +241,7 @@ def main():
 
     log.info(f"Ollama proxy starting on {LISTEN_HOST}:{LISTEN_PORT}")
     log.info(f"Forwarding to: {colab_url}")
+    log.info(f"Using num_ctx: {DEFAULT_NUM_CTX}")
 
     server = ThreadedHTTPServer((LISTEN_HOST, LISTEN_PORT), ProxyHandler)
     log.info("Proxy ready.")
