@@ -1,6 +1,6 @@
 # ollama-switcher
 
-Switches Windows Ollama between local GPU and a remote Google Colab instance via a reverse proxy. Kali Linux VM never needs changes — it always talks to `http://10.0.2.2:11434`.
+Switches Windows Ollama between local GPU and a remote Google Colab instance via a reverse proxy. Kali Linux VM never needs changes — it always talks to `localhost:11434`.
 
 ## How it works
 
