@@ -1,0 +1,8 @@
+# Runtime files
+*.log
+*.pid
+
+# Claude Code local settings
+.claude/
+
+# Keep .env as a template (placeholder URL only — replace before use)
