@@ -40,7 +40,7 @@ def load_colab_url():
     """Read COLAB_URL from .env in same directory as this script."""
     if not os.path.exists(ENV_FILE):
         raise FileNotFoundError(f".env not found: {ENV_FILE}")
-    with open(ENV_FILE, encoding="utf-8") as f:
+    with open(ENV_FILE, encoding="utf-8-sig") as f:  # utf-8-sig strips BOM if present
         for line in f:
             line = line.strip()
             if not line or line.startswith("#"):
