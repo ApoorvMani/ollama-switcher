@@ -18,7 +18,7 @@ import logging
 LISTEN_HOST = "0.0.0.0"
 LISTEN_PORT = 11434
 CHUNK_SIZE = 4096
-TIMEOUT = 30
+TIMEOUT = 180  # 3 min — covers cold model load (11GB on Colab T4 takes ~60s)
 DEFAULT_NUM_CTX = int(os.environ.get("OLLAMA_NUM_CTX", 32768))
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -57,6 +57,9 @@ def load_colab_url():
 _STRIP_REQUEST_HEADERS = frozenset({
     "host", "connection", "proxy-connection", "keep-alive",
     "te", "trailers", "upgrade",
+    "content-length",       # let urllib set it from actual body bytes
+    "transfer-encoding",    # must not forward - we reassemble the body fully
+    "accept-encoding",      # prevent gzip response we can't transparently re-encode
 })
 _STRIP_RESPONSE_HEADERS = frozenset({
     "transfer-encoding", "connection", "keep-alive",
@@ -81,6 +84,9 @@ def inject_options(body: bytes) -> bytes:
     opts.setdefault("num_gpu", 99)       # offload all layers to GPU
     opts.setdefault("num_batch", 512)    # larger batch = faster prompt ingestion
     opts.setdefault("flash_attn", True)  # flash attention for speed + lower VRAM
+
+    # Keep model loaded 10 min between requests (default is 5 min)
+    data.setdefault("keep_alive", "10m")
 
     return json.dumps(data).encode()
 
@@ -159,8 +165,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             if key.lower() not in _STRIP_REQUEST_HEADERS:
                 req.add_header(key, val)
         
-        if content_length:
-            req.add_header("Content-Length", str(content_length))
+        # urllib sets Content-Length from data automatically; only force it if
+        # we modified the body (inject_options changes the byte count)
+        if body is not None:
+            req.add_header("Content-Length", str(len(body)))
 
         try:
             with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:

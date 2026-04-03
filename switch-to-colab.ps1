@@ -73,9 +73,16 @@ Write-Log "=== Switching to Colab: $Url ==="
 # ── Step 1: Stop local Ollama ─────────────────────────────────────────────────
 
 try {
+    # Kill tray app first so it doesn't auto-restart ollama serve
+    $trayProcs = Get-Process -Name "ollama app" -ErrorAction SilentlyContinue
+    if ($trayProcs) {
+        Stop-Process -Name "ollama app" -Force -ErrorAction SilentlyContinue
+        Write-Host "[OK] Stopped Ollama tray app (prevents auto-restart)"
+    }
     $ollamaProcs = Get-Process -Name "ollama" -ErrorAction SilentlyContinue
     if ($ollamaProcs) {
         Stop-Process -Name "ollama" -Force -ErrorAction Stop
+        Start-Sleep -Milliseconds 500  # give it time to release port 11434
         Write-Host "[OK] Stopped local Ollama"
     }
     else {
